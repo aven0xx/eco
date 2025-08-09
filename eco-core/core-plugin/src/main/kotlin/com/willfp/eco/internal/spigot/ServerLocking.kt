@@ -5,7 +5,7 @@ import org.bukkit.event.Listener
 import org.bukkit.event.player.PlayerLoginEvent
 
 object ServerLocking : Listener {
-    private var lockReason: String? = null
+    private var lockReason: String? = null/radle
 
     @Suppress("DEPRECATION")
     @EventHandler
