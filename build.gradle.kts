@@ -78,7 +78,7 @@ allprojects {
         maven("https://maven.enginehub.org/repo/")
 
         // FactionsUUID
-        //maven("https://ci.ender.zone/plugin/repository/everything/")
+        // maven("https://ci.ender.zone/plugin/repository/everything/")
 
         // NoCheatPlus
         maven("https://repo.md-5.net/content/repositories/snapshots/")
@@ -109,6 +109,9 @@ allprojects {
 
         // FancyHolograms
         maven("https://repo.fancyplugins.de/releases")
+
+        // Nexo
+        maven("https://repo.nexomc.com/releases")
     }
 
     dependencies {
@@ -134,6 +137,9 @@ allprojects {
         // Other
         implementation("com.github.ben-manes.caffeine:caffeine:3.1.5")
         implementation("org.apache.maven:maven-artifact:3.9.0")
+
+        // Nexo (compile-time only; not shaded)
+        compileOnly("com.nexomc:nexo:1.5.0")
     }
 
     tasks.withType<JavaCompile> {
