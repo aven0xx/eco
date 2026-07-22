@@ -37,4 +37,23 @@ internal class AnvilMathTests {
         Assertions.assertEquals(4, mergeEnchantLevel(4, 2, 5), "existing higher")
         Assertions.assertEquals(4, mergeEnchantLevel(2, 4, 5), "incoming higher")
     }
+
+    @Test
+    fun repairPerUnitMatchesVanillaQuarter() {
+        // ceil(maxDurability / 4) - identical to vanilla's unit-repair step.
+        Assertions.assertEquals(391, repairPerUnit(1561, VANILLA_REPAIR_FRACTION), "25% of 1561, rounded up")
+        Assertions.assertEquals(250, repairPerUnit(1000, VANILLA_REPAIR_FRACTION), "25% of 1000")
+    }
+
+    @Test
+    fun repairPerUnitCustomFraction() {
+        Assertions.assertEquals(100, repairPerUnit(1000, 0.1), "10% of 1000")
+        Assertions.assertEquals(500, repairPerUnit(1000, 0.5), "50% of 1000")
+    }
+
+    @Test
+    fun repairPerUnitFlooredAtOne() {
+        Assertions.assertEquals(1, repairPerUnit(1, 0.25), "tiny durability floors at 1")
+        Assertions.assertEquals(1, repairPerUnit(100, 0.0), "zero fraction floors at 1")
+    }
 }

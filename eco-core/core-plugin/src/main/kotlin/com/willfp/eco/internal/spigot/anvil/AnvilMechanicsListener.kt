@@ -3,6 +3,7 @@ package com.willfp.eco.internal.spigot.anvil
 import com.willfp.eco.core.EcoPlugin
 import com.willfp.eco.core.anvil.AnvilHandler
 import com.willfp.eco.core.anvil.AnvilHandlers
+import com.willfp.eco.core.anvil.AnvilRepairs
 import com.willfp.eco.core.anvil.AnvilSettings
 import com.willfp.eco.core.fast.fast
 import com.willfp.eco.core.proxy.ProxyConstants
@@ -43,6 +44,21 @@ private val FAIL = AnvilResult(null, null)
 class AnvilMechanicsListener(
     private val plugin: EcoPlugin
 ) : Listener {
+    private companion object {
+        /**
+         * Vanilla-like settings used when the shell runs in repair-only mode (a custom repair is
+         * registered but no [AnvilHandler], so there is no plugin to supply [AnvilSettings]).
+         */
+        val DEFAULT_ANVIL_SETTINGS = AnvilSettings(
+            costExponent = 1.0,
+            enchantLimit = 0,
+            useReworkPenalty = true,
+            maxRepairCost = 40,
+            clampRepairCost = false,
+            colorNameAllowed = { false }
+        )
+    }
+
     /** Per-player counter bumped on every [onAnvilPrepare], used to invalidate in-flight previews. */
     private val latestPreviewGeneration = mutableMapOf<UUID, Int>()
 
@@ -65,7 +81,7 @@ class AnvilMechanicsListener(
     /** Prevents taking a stale preview result before its async computation has finished rendering. */
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     fun onAnvilResultClick(event: InventoryClickEvent) {
-        if (AnvilHandlers.handler() == null) return
+        if (AnvilHandlers.handler() == null && AnvilRepairs.isEmpty()) return
         val player = event.whoClicked as? Player ?: return
         val inventory = event.view.topInventory as? AnvilInventory ?: return
         if (event.rawSlot != 2) return
@@ -103,12 +119,24 @@ class AnvilMechanicsListener(
     @Suppress("UnstableApiUsage")
     @EventHandler(priority = EventPriority.HIGHEST)
     fun onAnvilPrepare(event: PrepareAnvilEvent) {
-        val handler = AnvilHandlers.handler() ?: return
-        val settings = AnvilHandlers.settings() ?: return
+        val handler = AnvilHandlers.handler()
+
+        // The shell activates when an enchant handler is registered, or when at least one custom
+        // repair is registered. With neither, it stays completely inert and anvils are vanilla.
+        if (handler == null && AnvilRepairs.isEmpty()) return
 
         val leftItem = event.inventory.getItem(0)
         val rightItem = event.inventory.getItem(1)
         val viewer = event.viewers.getOrNull(0) as? Player
+
+        // Repair-only mode (no enchant handler registered): only take over the anvil when the
+        // inputs actually match a registered custom repair. Every other interaction - vanilla
+        // enchant merges, enchanted-book applications, same-tool combines - is left to vanilla,
+        // so registering a repair never regresses normal anvil behaviour.
+        if (handler == null && AnvilRepairs.getMatch(leftItem, rightItem) == null) return
+
+        // Repair-only mode has no plugin-supplied settings; fall back to vanilla-like defaults.
+        val settings = AnvilHandlers.settings() ?: DEFAULT_ANVIL_SETTINGS
 
         // A matching custom AnvilRecipe (WorkstationRecipeListener, lower priority) has already
         // set event.result. Defer to it entirely, clearing any stale preview-generation state
@@ -130,7 +158,7 @@ class AnvilMechanicsListener(
         latestPreviewGeneration[player.uniqueId] = generation
         renderedPreviewGeneration.remove(player.uniqueId)
 
-        if (handler.isBlocked(leftItem, rightItem)) {
+        if (handler?.isBlocked(leftItem, rightItem) == true) {
             event.result = null
             event.inventory.setItem(2, null)
             return
@@ -207,7 +235,7 @@ class AnvilMechanicsListener(
         right: ItemStack?,
         itemName: String,
         player: Player,
-        handler: AnvilHandler,
+        handler: AnvilHandler?,
         settings: AnvilSettings
     ): AnvilResult {
         if (left == null || left.type == Material.AIR) return FAIL
@@ -228,12 +256,27 @@ class AnvilMechanicsListener(
         val leftMeta = left.itemMeta
         val rightMeta = right.itemMeta
         var unitRepairCost = 0
+        var repaired = false
 
-        if (left.type != right.type) {
+        // Plugin-registered custom repair takes precedence over the vanilla material table: a
+        // plugin can make any item (matched via the eco item lookup, including eco/custom items)
+        // repairable by any material item. Like vanilla unit repair, this restores durability on
+        // the left item in place rather than producing a new one.
+        val customRepair = AnvilRepairs.getMatch(left, right)
+        if (customRepair != null && leftMeta is Damageable) {
+            val perUnit = repairPerUnit(left.type.maxDurability.toInt(), customRepair.repairFraction)
+            val unitsNeeded = ceil(leftMeta.damage.toDouble() / perUnit).toInt()
+            val toConsume = min(unitsNeeded, right.amount)
+            if (toConsume <= 0) return FAIL
+            leftMeta.damage = (leftMeta.damage - toConsume * perUnit).coerceAtLeast(0)
+            right.amount -= toConsume
+            unitRepairCost = toConsume * customRepair.xpCostPerUnit
+            repaired = true
+        } else if (left.type != right.type) {
             if (right.type.canUnitRepair(left.type) && leftMeta is Damageable) {
-                val perUnit = ceil(left.type.maxDurability / 4.0).toInt()
-                val max = ceil(leftMeta.damage.toDouble() / perUnit).toInt()
-                val toDeduct = min(max, right.amount)
+                val perUnit = repairPerUnit(left.type.maxDurability.toInt(), VANILLA_REPAIR_FRACTION)
+                val unitsNeeded = ceil(leftMeta.damage.toDouble() / perUnit).toInt()
+                val toDeduct = min(unitsNeeded, right.amount)
                 unitRepairCost = toDeduct
                 if (toDeduct <= 0) {
                     return FAIL
@@ -241,6 +284,7 @@ class AnvilMechanicsListener(
                     val newDamage = leftMeta.damage - toDeduct * perUnit
                     leftMeta.damage = newDamage.coerceAtLeast(0)
                     right.amount -= toDeduct
+                    repaired = true
                 }
             } else {
                 if (right.type != Material.ENCHANTED_BOOK) return FAIL
@@ -250,23 +294,27 @@ class AnvilMechanicsListener(
         left.fast().displayName = formattedItemName.let { "§o$it" }
 
         val leftEnchants = left.fast().getEnchants(true)
-        val rightEnchants = right.fast().getEnchants(true)
         val outEnchants = leftEnchants.toMutableMap()
 
-        for ((enchant, level) in rightEnchants) {
-            if (outEnchants.containsKey(enchant)) {
-                val currentLevel = outEnchants[enchant]!!
-                outEnchants[enchant] = mergeEnchantLevel(currentLevel, level, handler.maxLevel(enchant))
-            } else {
-                if (handler.canCombine(enchant, level, left, outEnchants.keys)) {
-                    if (outEnchants.size < settings.enchantLimit.infiniteIfNegative()) {
-                        outEnchants[enchant] = level
+        // Enchant merging is the enchant handler's job; a repair-only setup (no handler) leaves
+        // the item's enchants untouched and just repairs / renames.
+        if (handler != null) {
+            val rightEnchants = right.fast().getEnchants(true)
+            for ((enchant, level) in rightEnchants) {
+                if (outEnchants.containsKey(enchant)) {
+                    val currentLevel = outEnchants[enchant]!!
+                    outEnchants[enchant] = mergeEnchantLevel(currentLevel, level, handler.maxLevel(enchant))
+                } else {
+                    if (handler.canCombine(enchant, level, left, outEnchants.keys)) {
+                        if (outEnchants.size < settings.enchantLimit.infiniteIfNegative()) {
+                            outEnchants[enchant] = level
+                        }
                     }
                 }
             }
         }
 
-        if (leftMeta is Damageable && rightMeta is Damageable && unitRepairCost == 0 && rightMeta !is EnchantmentStorageMeta) {
+        if (leftMeta is Damageable && rightMeta is Damageable && !repaired && rightMeta !is EnchantmentStorageMeta) {
             val maxDamage = left.type.maxDurability.toInt()
             val leftDurability = maxDamage - leftMeta.damage
             val rightDurability = maxDamage - rightMeta.damage

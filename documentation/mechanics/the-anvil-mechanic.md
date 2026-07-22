@@ -21,9 +21,10 @@ itself stays config-agnostic: eco owns the *mechanics*, and the plugin that regi
 handler owns the *rules*.
 
 :::info
-If no plugin registers an anvil handler, the eco anvil shell is completely inert and your
-server's anvils behave exactly like vanilla. The mechanic only activates once something
-calls `AnvilHandlers.register(...)`.
+If nothing registers an anvil handler **or** a custom repair, the eco anvil shell is
+completely inert and your server's anvils behave exactly like vanilla. The mechanic activates
+once something calls `AnvilHandlers.register(...)` (full enchant control) or
+`AnvilRepairs.register(...)` (see [Custom item repairs](#custom-item-repairs)).
 :::
 
 ## The "shell and handler" design
@@ -104,7 +105,9 @@ owns this.
 | --- | --- | --- |
 | `AnvilHandler` | `eco-api` · `core/anvil` | Interface plugins implement for enchant rules. |
 | `AnvilSettings` | `eco-api` · `core/anvil` | Data class of numeric/behavioural knobs. |
-| `AnvilHandlers` | `eco-api` · `core/anvil` | Global single-slot registry. |
+| `AnvilHandlers` | `eco-api` · `core/anvil` | Global single-slot registry for the enchant handler. |
+| `AnvilRepairRegistration` | `eco-api` · `core/anvil` | A plugin-supplied durability repair rule (repairable + material). |
+| `AnvilRepairs` | `eco-api` · `core/anvil` | Registry of custom repairs (many may be registered). |
 | `AnvilRecipe` | `eco-api` · `core/recipe/workstation` | A custom "base + material → output" anvil recipe. |
 | `AnvilMechanicsListener` | `core-plugin` · `internal/spigot/anvil` | The shell. Listens to anvil events and computes the result. |
 | `AnvilRepair` | `core-plugin` · `internal/spigot/anvil` | Loads the unit-repair material table from `anvil/repair.json`. |
@@ -119,8 +122,11 @@ All of the interesting work happens in `AnvilMechanicsListener` on the Bukkit
 
 The flow, step by step:
 
-1. **Bail out if inactive.** If no handler is registered, the listener returns immediately
-   and vanilla behaviour applies.
+1. **Bail out if inactive.** If neither a handler nor any custom repair is registered, the
+   listener returns immediately and vanilla behaviour applies. In **repair-only mode** (custom
+   repairs registered but no handler), the listener additionally returns unless the current
+   inputs match a registered repair — so ordinary anvil use (book applications, tool combines,
+   vanilla enchant merges) is left entirely to vanilla and never regresses.
 
 2. **Defer to custom recipes.** `WorkstationRecipeListener` handles `PrepareAnvilEvent` at
    `HIGH` priority; the mechanics shell runs later at `HIGHEST`. If a custom `AnvilRecipe`
@@ -268,6 +274,113 @@ Loading this from a resource file rather than hard-coding it means:
 A units entry may also reference a tag with the `TAG:` prefix (currently `TAG:PLANKS`),
 which expands to every material in that tag.
 
+The built-in table is **vanilla-materials-only** — it can't target a specific eco/custom item
+or be fed by a custom repair material, because it matches on `Material` alone. That extensible
+capability is provided separately by [custom item repairs](#custom-item-repairs).
+
+## Custom item repairs
+
+The built-in table above only knows about vanilla materials. To let **any** item — including
+eco items and custom items from other plugins — be repaired by **any** material (vanilla or
+custom), a plugin registers an `AnvilRepairRegistration`. This is a true durability repair: the
+left item is restored in place, exactly like vanilla unit repair, and is **not** replaced by a
+new item.
+
+This is distinct from an [`AnvilRecipe`](#custom-anvil-recipes), which produces a fixed output
+item. Use a repair registration when you want "consume this material to restore durability on
+that item"; use an `AnvilRecipe` when you want "these inputs craft that output".
+
+### Registering a repair
+
+Both the repairable item and the repair material are matched with eco's
+[item lookup system](../lookup-systems/the-item-lookup-system/the-item-lookup-system.md), so
+either side can be a vanilla material, an eco item, or a custom item from another plugin.
+
+```kotlin
+import com.willfp.eco.core.anvil.AnvilRepairRegistration
+import com.willfp.eco.core.items.Items
+
+// A custom "reinforced blade" repaired by a custom "hardened alloy" ingot.
+AnvilRepairRegistration.builder(
+    Items.lookup("myplugin:reinforced_blade"),
+    Items.lookup("myplugin:hardened_alloy")
+)
+    .repairFraction(0.25)   // restore 25% of max durability per ingot (default; vanilla-equivalent)
+    .xpCostPerUnit(2)       // 2 XP levels per ingot consumed (default 1)
+    .build()
+    .register()
+```
+
+There is also a string overload that resolves the lookup keys for you:
+
+```kotlin
+AnvilRepairRegistration.builder("diamond_sword", "myplugin:repair_gem")
+    .build()
+    .register()
+```
+
+From Java the API is identical (the builder is `@JvmStatic`):
+
+```java
+AnvilRepairRegistration.builder(
+        Items.lookup("myplugin:reinforced_blade"),
+        Items.lookup("myplugin:hardened_alloy"))
+    .repairFraction(0.25)
+    .xpCostPerUnit(2)
+    .build()
+    .register();
+```
+
+Unregister with `AnvilRepairs.unregister(registration)`, or `AnvilRepairs.clear()` to remove all.
+
+### Options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `repairable` | — | The item that gets repaired (left slot). Any `TestableItem`. |
+| `material` | — | The item consumed to repair it (right slot). Any `TestableItem`. |
+| `repairFraction` | `0.25` | Fraction of the repaired item's **max durability** restored per unit of material consumed. `0.25` matches vanilla (25% per unit). Each unit always restores at least 1 durability. |
+| `xpCostPerUnit` | `1` | Experience-level cost added per unit of material consumed. |
+
+**How much gets consumed.** The anvil consumes only as many units as are needed to fully
+repair the item (capped by the stack size), exactly like vanilla — repairing a nearly-full
+item takes one unit, a heavily-damaged one takes several. The durability restored per unit is
+`ceil(maxDurability × repairFraction)`.
+
+:::tip
+Keep `xpCostPerUnit` at `1` or higher. A cost of `0` on an item with no prior-work penalty
+produces a zero total level cost, and the anvil (like vanilla) shows no result at zero cost.
+:::
+
+### Works with or without EcoEnchants
+
+Repairs are **independent of the enchant handler**:
+
+- **With an enchant handler** (e.g. EcoEnchants) registered, repairs work alongside it — the
+  shell checks for a matching repair before applying enchant-merge logic.
+- **Without any handler** ("repair-only mode"), the shell activates purely to service repairs.
+  It only takes over an anvil interaction when the inputs match a registered repair; every
+  other interaction is left to vanilla, so nothing else changes.
+
+In repair-only mode the shell uses vanilla-like defaults for cost behaviour (linear cost, a
+prior-work penalty, and a maximum repair cost of 40) since there is no plugin to supply
+[`AnvilSettings`](#anvilsettings).
+
+### Precedence
+
+When more than one system could act on the same inputs, the order is:
+
+1. **`AnvilRecipe`** (custom crafting) — if a recipe matches, it wins and produces its output.
+2. **Custom repair** (`AnvilRepairRegistration`) — checked before the vanilla table.
+3. **Vanilla unit repair** (`repair.json`) — the built-in material table.
+4. **Enchant merging** — via the registered `AnvilHandler`, if any.
+
+### Backwards compatibility
+
+This feature is purely additive. `AnvilHandler`, `AnvilHandlers`, and `AnvilSettings` are
+unchanged, so **existing plugins that register an anvil handler (such as EcoEnchants) need no
+updates** — if no repairs are registered, the anvil behaves exactly as it did before.
+
 ## Custom anvil recipes
 
 Separately from enchant merging, eco supports fully custom anvil *recipes* through
@@ -342,3 +455,7 @@ AnvilHandlers.register(
 From that point on, every anvil on the server routes through the eco shell, and your handler
 decides how enchants combine while eco handles everything else. Call
 `AnvilHandlers.unregister()` to hand anvils back to vanilla.
+
+If all you need is custom durability repairs — not full enchant control — you don't need a
+handler at all; register an `AnvilRepairRegistration` instead (see
+[Custom item repairs](#custom-item-repairs)).
